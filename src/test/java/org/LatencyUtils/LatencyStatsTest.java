@@ -10,11 +10,13 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 /**
@@ -314,6 +316,118 @@ public class LatencyStatsTest {
         } finally {
             latencyStats.stop();
             pauseDetector.shutdown();
+        }
+    }
+
+    @Test
+    public void testPauseLongerThanHighestTrackableLatency() throws Exception {
+        final long highestTrackableLatency = 1000L * MSEC; // 1 sec
+        final long pauseLength = 1000L * 1000L * MSEC; // 1000 sec, far beyond highestTrackableLatency
+        final int recordedLatencyCount = 8;
+
+        final InjectedPauseDetector pauseDetector = new InjectedPauseDetector();
+        LatencyStats latencyStats = null;
+
+        try {
+            latencyStats = LatencyStats.Builder.create()
+                    .lowestTrackableLatency(1000L)
+                    .highestTrackableLatency(highestTrackableLatency)
+                    .numberOfSignificantValueDigits(numberOfSignificantValueDigits)
+                    .intervalEstimatorWindowLength(4)
+                    .pauseDetector(pauseDetector)
+                    .build();
+
+            // Registered after the LatencyStats instance, so it is notified once that instance handled the pause:
+            pauseDetector.addListener(new PauseDetectorListener() {
+                public void handlePauseEvent(final long length, final long endTime) {
+                    pauseDetector.pauseHandled.countDown();
+                }
+            });
+
+            // Establish a 1 msec estimated interval between recordings:
+            for (int i = 0; i < recordedLatencyCount; i++) {
+                TimeServices.moveTimeForward(MSEC);
+                latencyStats.recordLatency(MSEC);
+            }
+
+            pauseDetector.injectPause(pauseLength, TimeServices.nanoTime());
+
+            Assert.assertTrue("pause notification was not handled",
+                    pauseDetector.pauseHandled.await(10, TimeUnit.SECONDS));
+            Throwable failure = pauseDetector.listenerFailure.get();
+            Assert.assertNull("handling a pause longer than highestTrackableLatency threw " + failure, failure);
+
+            Histogram intervalHistogram = latencyStats.getIntervalHistogram();
+            Assert.assertTrue("pause corrections should be recorded",
+                    intervalHistogram.getTotalCount() > recordedLatencyCount);
+            Assert.assertTrue("pause corrections should be capped at highestTrackableLatency, max = " +
+                            intervalHistogram.getMaxValue(),
+                    intervalHistogram.getMaxValue() <= intervalHistogram.highestEquivalentValue(highestTrackableLatency));
+        } finally {
+            if (latencyStats != null) {
+                latencyStats.stop();
+            }
+            pauseDetector.shutdown();
+        }
+    }
+
+    @Test
+    public void testPauseDetectorSurvivesListenerFailure() throws Exception {
+        final InjectedPauseDetector pauseDetector = new InjectedPauseDetector();
+        final CountDownLatch secondPauseDelivered = new CountDownLatch(1);
+
+        try {
+            pauseDetector.addListener(new PauseDetectorListener() {
+                public void handlePauseEvent(final long length, final long endTime) {
+                    if (length == 1) {
+                        throw new IllegalStateException("listener failure on first pause");
+                    }
+                }
+            }, true);
+            pauseDetector.addListener(new PauseDetectorListener() {
+                public void handlePauseEvent(final long length, final long endTime) {
+                    if (length == 2) {
+                        secondPauseDelivered.countDown();
+                    }
+                }
+            });
+
+            pauseDetector.injectPause(1, TimeServices.nanoTime());
+            pauseDetector.injectPause(2, TimeServices.nanoTime());
+
+            Assert.assertTrue("pause detector stopped notifying listeners after a listener failure",
+                    secondPauseDelivered.await(10, TimeUnit.SECONDS));
+        } finally {
+            pauseDetector.shutdown();
+        }
+    }
+
+    /**
+     * A PauseDetector with no detection threads of its own: pauses are injected directly by the test.
+     * Any exception thrown by a listener while handling a pause is recorded, and then re-thrown so that
+     * the pause detector thread sees it exactly as it otherwise would.
+     */
+    static class InjectedPauseDetector extends PauseDetector {
+        final AtomicReference<Throwable> listenerFailure = new AtomicReference<Throwable>();
+        final CountDownLatch pauseHandled = new CountDownLatch(1);
+
+        void injectPause(final long pauseLength, final long pauseEndTime) {
+            notifyListeners(pauseLength, pauseEndTime);
+        }
+
+        @Override
+        public synchronized void addListener(final PauseDetectorListener listener, final boolean isHighPriority) {
+            super.addListener(new PauseDetectorListener() {
+                public void handlePauseEvent(final long length, final long endTime) {
+                    try {
+                        listener.handlePauseEvent(length, endTime);
+                    } catch (RuntimeException ex) {
+                        listenerFailure.compareAndSet(null, ex);
+                        pauseHandled.countDown();
+                        throw ex;
+                    }
+                }
+            }, isHighPriority);
         }
     }
 
