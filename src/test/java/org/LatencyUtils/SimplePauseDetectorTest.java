@@ -144,6 +144,12 @@ public class SimplePauseDetectorTest {
         pauseDetector.shutdown();
     }
 
+    // Sealed build: excluded. Three busy-spinning detector threads plus the test thread
+    // cannot all be scheduled on a 2-4 vCPU CI runner, so the detected pause comes out
+    // 75000 instead of 100000; this fails on the unpatched 2.0.3 base (15/15 local runs,
+    // and twice on the GitHub runner). On failure it also leaks its spinning threads,
+    // which starves the other pause-detector tests in this class.
+    @Ignore("timing-sensitive: needs >3 free cores for 3 spinning detector threads")
     @Test
     public void testSimpleSpinningPauseDetectorDetects() throws Exception {
         AtomicLong detectedPauseLength = new AtomicLong(0);

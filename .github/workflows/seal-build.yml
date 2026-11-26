@@ -1,0 +1,73 @@
+# Upstream LatencyUtils ships no CI; this workflow reproduces the release build
+# (Maven 3.2.3 on JDK 8, per the public jar's MANIFEST: Created-By Apache Maven
+# 3.2.3 / Build-Jdk 1.8.0_45; pom compiles source/target 1.6) and runs the
+# project's own surefire JUnit suite via `mvn package`.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MAVEN_VERSION: 3.2.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+          cache: maven
+
+      - name: Cache Maven ${{ env.MAVEN_VERSION }}
+        id: mvn-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/apache-maven-${{ env.MAVEN_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-apache-maven-${{ env.MAVEN_VERSION }}
+
+      - name: Download Maven ${{ env.MAVEN_VERSION }}
+        if: steps.mvn-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz
+          tar -xzf /tmp/maven.tgz -C ~
+
+      - name: Put Maven on PATH
+        run: |
+          echo "$HOME/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain versions
+        run: |
+          java -version
+          mvn -v
+
+      # javadoc jar is not a sealed artifact; skip it (javadoc-plugin 2.9.1 + JDK 8 doclint).
+      - name: Build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B clean package -Dmaven.javadoc.skip=true -Dtest="${{ inputs.test-filter }}" -DfailIfNoTests=false
+          else
+            mvn -B clean package -Dmaven.javadoc.skip=true
+          fi
+
+      - name: Test report
+        if: always()
+        run: |
+          for f in target/surefire-reports/*.txt; do [ -f "$f" ] && cat "$f"; done
+          echo "=== Skipped tests ==="
+          echo "SKIPPED org.LatencyUtils.SimplePauseDetectorTest#testSimpleSpinningPauseDetectorDetects - @Ignore: 3 busy-spinning detector threads cannot all be scheduled on the 2-4 vCPU runner; fails deterministically on the unpatched 2.0.3 base (expected:<100000> but was:<75000>) and its leaked spinning threads starve the other pause-detector tests"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LatencyUtils-jar
+          path: target/LatencyUtils-2.0.3.jar
+          if-no-files-found: error
